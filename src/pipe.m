@@ -156,8 +156,13 @@ XPC_CLASS_HEADER(pipe);
 	return status;
 }
 
+// Per-message receive traces go to the kernel log only in a build that defines XPC_PIPE_TRACE.
+#ifdef XPC_PIPE_TRACE
 extern void __simple_kprintf(const char* format, ...);
 #define rxp_kprintf __simple_kprintf
+#else
+#define rxp_kprintf(...) ((void)0)
+#endif
 
 + (int)receiveMachMessageWithPort: (mach_port_t)port incomingMessage: (dispatch_mach_msg_t*)incomingMessage flags: (uint64_t)flags
 {
