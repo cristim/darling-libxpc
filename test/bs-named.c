@@ -1,5 +1,7 @@
 // Needs the launchd test service (launchd-service/, plist installed with the tests) to be registered.
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <bootstrap.h>
 #include <xpc/xpc.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -9,13 +11,55 @@
 // private API under test; declared here because the SDK does not ship it
 xpc_endpoint_t xpc_endpoint_create_bs_named(const char* name, uint64_t flags, uint8_t* out_type);
 
+static int send_refs(mach_port_t port) {
+	mach_port_urefs_t refs = 0;
+	return mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) == KERN_SUCCESS ? (int)refs : -1;
+}
+
 int main(void) {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	char missing[160];
 	snprintf(missing, sizeof(missing), "org.darlinghq.test.no-such-service.%ld", (long)getpid());
 
 	uint8_t type = 0xAA;
 	if (xpc_endpoint_create_bs_named(missing, 0, &type) != NULL) {
 		fprintf(stderr, "FAIL: an endpoint was returned for a service that does not exist\n");
+		return 1;
+	}
+
+	// defensive guard: bootstrap_look_up(NULL) fails without crashing too, but the result must be NULL either way
+	if (xpc_endpoint_create_bs_named(NULL, 0, &type) != NULL) {
+		fprintf(stderr, "FAIL: an endpoint was returned for a NULL name\n");
+		return 1;
+	}
+
+	// the out parameter is optional
+	xpc_endpoint_t no_type = xpc_endpoint_create_bs_named(TEST_SERVICE_NAME, 0, NULL);
+	if (no_type == NULL) {
+		fprintf(stderr, "FAIL: no endpoint for the registered service when out_type is NULL\n");
+		return 1;
+	}
+	xpc_release(no_type);
+
+	// each endpoint owns exactly the one send right bootstrap_look_up gave it: creating and releasing many must leave
+	// our own right to the same port unchanged (a missed release leaks rights, an extra release steals ours)
+	mach_port_t own = MACH_PORT_NULL;
+	if (bootstrap_look_up(bootstrap_port, TEST_SERVICE_NAME, &own) != KERN_SUCCESS) {
+		fprintf(stderr, "FAIL: look up of the registered service failed\n");
+		return 1;
+	}
+	int before = send_refs(own);
+	for (int i = 0; i < 200; i++) {
+		xpc_endpoint_t e = xpc_endpoint_create_bs_named(TEST_SERVICE_NAME, 0, &type);
+		if (e == NULL) {
+			fprintf(stderr, "FAIL: no endpoint on iteration %d\n", i);
+			return 1;
+		}
+		xpc_release(e);
+	}
+	int after = send_refs(own);
+	if (before != after) {
+		fprintf(stderr, "FAIL: send right urefs %d before, %d after 200 endpoint create/release\n", before, after);
 		return 1;
 	}
 
