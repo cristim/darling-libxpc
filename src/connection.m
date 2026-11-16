@@ -157,6 +157,18 @@ static audit_token_t* get_audit_token(mach_msg_header_t* header) {
 	return token;
 };
 
+// A handler may replace itself (xpc_connection_set_event_handler from inside the handler) or be dropped by its owner
+// while it runs. Hold the block for the duration of the call so what it captured outlives its own body.
+static void call_event_handler(XPC_CLASS(connection)* self, xpc_object_t event) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t handler = Block_copy(this->event_handler);
+
+	if (handler) {
+		handler(event);
+		Block_release(handler);
+	}
+};
+
 static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, dispatch_mach_msg_t message, mach_error_t error) {
 	XPC_CLASS(connection)* self = context;
 	XPC_THIS_DECL(connection);
@@ -205,7 +217,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				}
 				[self addServerPeer: serverPeer]; // takes ownership of the server peer connection
 
-				this->event_handler(serverPeer);
+				call_event_handler(self, serverPeer);
 			} else {
 				XPC_CLASS(dictionary)* dict = nil;
 				audit_token_t* token = NULL;
@@ -229,7 +241,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 					[dict setAssociatedAuditToken: token];
 				}
 
-				this->event_handler(dict);
+				call_event_handler(self, dict);
 			}
 		} break;
 
@@ -246,7 +258,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 			[self.parentServer removeServerPeer: self]; // server peers should unregister themselves from their parent servers
 			xpc_log_debug(connection, "connection %p: cancelled", self);
 
-			this->event_handler(XPC_ERROR_CONNECTION_INVALID);
+			call_event_handler(self, XPC_ERROR_CONNECTION_INVALID);
 
 			// we're never going to call the event handler again, so release it;
 			// if they were holding a reference on us, it gets released
@@ -310,12 +322,12 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				dispatch_mach_reconnect(this->mach_ctx, this->send_port, checkinMessage);
 
 				// let the user know that the connection got wonky
-				this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
+				call_event_handler(self, XPC_ERROR_CONNECTION_INTERRUPTED);
 			}
 		} break;
 
 		case DISPATCH_MACH_SIGTERM_RECEIVED: {
-			this->event_handler(XPC_ERROR_TERMINATION_IMMINENT);
+			call_event_handler(self, XPC_ERROR_TERMINATION_IMMINENT);
 		} break;
 
 		default: {
