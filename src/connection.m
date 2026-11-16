@@ -157,15 +157,42 @@ static audit_token_t* get_audit_token(mach_msg_header_t* header) {
 	return token;
 };
 
-// A handler may replace itself (xpc_connection_set_event_handler from inside the handler) or be dropped by its owner
-// while it runs. Hold the block for the duration of the call so what it captured outlives its own body.
+// Swaps the handler slot under the lock; the caller releases the returned old block outside it.
+static xpc_handler_t exchange_event_handler(XPC_CLASS(connection)* self, xpc_handler_t newHandler) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t old = NULL;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	old = this->event_handler;
+	this->event_handler = newHandler;
+	pthread_mutex_unlock(&this->event_handler_lock);
+
+	return old;
+};
+
+// Calls the event handler that is current when the event is delivered. The block is retained under the same lock that
+// replacing it takes, so a replacement (from another thread, or from inside the handler itself) cannot free it between
+// being read and being retained, and it outlives its own body: what it captured stays alive until it returns.
+// A replacement made while a handler runs takes effect from the next event; it does not interrupt the running call.
 static void call_event_handler(XPC_CLASS(connection)* self, xpc_object_t event) {
 	XPC_THIS_DECL(connection);
-	xpc_handler_t handler = Block_copy(this->event_handler);
+	xpc_handler_t handler = NULL;
+	bool log_missing = false;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	handler = Block_copy(this->event_handler);
+	if (!handler && !this->no_handler_logged) {
+		this->no_handler_logged = true;
+		log_missing = true;
+	}
+	pthread_mutex_unlock(&this->event_handler_lock);
 
 	if (handler) {
 		handler(event);
 		Block_release(handler);
+	} else if (log_missing) {
+		// libxpc used to crash here; real behaviour is NEEDS-REAL-MAC. Fail loud once instead of silently dropping.
+		xpc_log_fault(connection, "connection %p (service %s) received an event but has no event handler; dropping events", self, this->service_name ? this->service_name : "(anonymous)");
 	}
 };
 
@@ -262,8 +289,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 
 			// we're never going to call the event handler again, so release it;
 			// if they were holding a reference on us, it gets released
-			Block_release(this->event_handler);
-			this->event_handler = NULL;
+			Block_release(exchange_event_handler(self, NULL));
 
 			// we've been cancelled; this is the very last event we'll ever receive, so we can release our internal reference now.
 			// note that this doesn't mean we instantly die; the user might still be holding their reference on us
@@ -483,9 +509,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 - (void)setEventHandler: (xpc_handler_t)eventHandler
 {
-	XPC_THIS_DECL(connection);
-	Block_release(this->event_handler);
-	this->event_handler = Block_copy(eventHandler);
+	Block_release(exchange_event_handler(self, Block_copy(eventHandler)));
 }
 
 - (xpc_finalizer_t)finalizer
@@ -578,6 +602,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_destroy(&this->activated_lock);
 	pthread_rwlock_destroy(&this->server_peers_lock);
 	pthread_rwlock_destroy(&this->remote_credentials_lock);
+	pthread_mutex_destroy(&this->event_handler_lock);
 
 	xpc_assumes_zero(xpc_mach_port_release_send(this->send_port));
 	xpc_assumes_zero(xpc_mach_port_release_send(this->checkin_port));
@@ -613,6 +638,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_init(&this->activated_lock, NULL);
 	pthread_rwlock_init(&this->server_peers_lock, NULL);
 	pthread_rwlock_init(&this->remote_credentials_lock, NULL);
+	pthread_mutex_init(&this->event_handler_lock, NULL);
 
 	this->suspension_count = 1;
 

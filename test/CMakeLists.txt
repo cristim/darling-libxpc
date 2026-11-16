@@ -86,3 +86,13 @@ target_link_libraries(libxpc_test_handler_lifetime
 )
 
 install(TARGETS libxpc_test_handler_lifetime DESTINATION libexec/darling/usr/libexec)
+
+
+add_darling_executable(libxpc_test_handler_race handler-race.m)
+
+target_link_libraries(libxpc_test_handler_race
+	xpc_static
+	objc
+)
+
+install(TARGETS libxpc_test_handler_race DESTINATION libexec/darling/usr/libexec)
