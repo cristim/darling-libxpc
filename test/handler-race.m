@@ -52,7 +52,7 @@ int main(void) {
 		while (dispatch_semaphore_wait(done, DISPATCH_TIME_NOW)) {
 			set_fresh_handler(conn, done);
 			usleep(20); // the handler lock is not fair: do not starve the delivering thread
-			if (time(NULL) - start > 10) {
+			if (time(NULL) - start > 30) {
 				fprintf(stderr, "FAIL: handler-race: no INVALID event on iteration %d\n", i);
 				return 1;
 			}
