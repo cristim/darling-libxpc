@@ -17,6 +17,7 @@
  * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
 #import <xpc/objects/endpoint.h>
 #import <xpc/util.h>
 #import <xpc/xpc.h>
@@ -178,6 +179,20 @@ XPC_EXPORT
 xpc_endpoint_t xpc_endpoint_create_bs_named(const char* name, uint64_t flags, uint8_t* out_type) {
 	// parameter 3's purpose is a guess
 	xpc_stub();
+	if (getenv("DARLING_XPC_DIAG_BSEP")) {
+		// EXPERIMENT arm A: hand back an endpoint of a silent anonymous listener instead of NULL
+		static xpc_endpoint_t ep; static dispatch_once_t once;
+		dispatch_once(&once, ^{
+			xpc_connection_t l = xpc_connection_create(NULL, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
+			xpc_connection_set_event_handler(l, ^(xpc_object_t e) {});
+			xpc_connection_resume(l);
+			ep = xpc_endpoint_create(l);
+		});
+		if (out_type) *out_type = 0;
+		fprintf(stderr, "XPCDIAG bs_named name=%s ARM-A returning silent endpoint\n", name ? name : "(null)");
+		return xpc_retain(ep);
+	}
+	if (getenv("DARLING_XPC_DIAG")) { fprintf(stderr, "XPCDIAG bs_named name=%s flags=0x%llx out_type=%s\n", name ? name : "(null)", (unsigned long long)flags, out_type ? "non-null" : "null"); }
 	return NULL;
 };
 

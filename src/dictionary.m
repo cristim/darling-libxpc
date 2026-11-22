@@ -1,3 +1,4 @@
+#include <unistd.h>
 /**
  * This file is part of Darling.
  *
@@ -460,6 +461,13 @@ XPC_EXPORT
 xpc_object_t xpc_dictionary_create(const char* const* keys, const xpc_object_t* values, size_t count) {
 	return [[XPC_CLASS(dictionary) alloc] initWithObjects: (XPC_CLASS(object)* const*)values forKeys: keys count: count];
 };
+
+// L6 scratch (K2): a newer API the cache's clients import
+XPC_EXPORT
+xpc_object_t xpc_dictionary_create_empty(void) {
+	{ static const char m[] = "L6STUB xpc_dictionary_create_empty\n"; write(2, m, sizeof(m) - 1); }
+	return xpc_dictionary_create(NULL, NULL, 0);
+}
 
 XPC_EXPORT
 xpc_object_t xpc_dictionary_create_reply(xpc_object_t xorig) {

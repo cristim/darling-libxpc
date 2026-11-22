@@ -29,6 +29,12 @@
 #import <objc/runtime.h>
 #include <Block.h>
 
+#include <stdio.h>
+#include <time.h>
+static int xd_on(void) { static int v = -1; if (v < 0) v = getenv("DARLING_XPC_DIAG") != NULL; return v; }
+#define XD(fmt, ...) do { if (xd_on()) { struct timespec _t; clock_gettime(CLOCK_MONOTONIC, &_t); uint64_t _tid = 0; pthread_threadid_np(NULL, &_tid); fprintf(stderr, "XPCDIAG t=%ld.%03ld tid=%llu " fmt "\n", (long)_t.tv_sec % 1000, _t.tv_nsec / 1000000, (unsigned long long)_tid, ##__VA_ARGS__); } } while (0)
+#define XDN(this) ((this)->service_name ? (this)->service_name : "(anonymous)")
+
 XPC_CLASS_SYMBOL_DECL(connection);
 
 XPC_GENARR_DEF(connection, XPC_CLASS(connection)*, /* non-static */);
@@ -162,6 +168,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 	XPC_THIS_DECL(connection);
 
 	xpc_log_debug(connection, "connection %p: handler got event %lu (%s)\n", self, reason, reason_to_string(reason));
+	XD("conn=%p name=%s event=%s", self, XDN(this), reason_to_string(reason));
 
 	switch (reason) {
 		case DISPATCH_MACH_MESSAGE_RECEIVED: {
@@ -246,7 +253,16 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 			[self.parentServer removeServerPeer: self]; // server peers should unregister themselves from their parent servers
 			xpc_log_debug(connection, "connection %p: cancelled", self);
 
-			this->event_handler(XPC_ERROR_CONNECTION_INVALID);
+			XD("conn=%p name=%s deliver INVALID, handler=%p lookup_failed=%d", self, XDN(this), this->event_handler, (int)this->lookup_failed);
+			if (getenv("DARLING_XPC_DIAG_KEEPH")) {
+				// EXPERIMENT arm B: keep the handler alive for the duration of the call even if it replaces itself
+				xpc_handler_t held = Block_copy(this->event_handler);
+				held(XPC_ERROR_CONNECTION_INVALID);
+				Block_release(held);
+			} else {
+				this->event_handler(XPC_ERROR_CONNECTION_INVALID);
+			}
+			XD("conn=%p name=%s INVALID delivered; releasing handler", self, XDN(this));
 
 			// we're never going to call the event handler again, so release it;
 			// if they were holding a reference on us, it gets released
@@ -310,7 +326,8 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				dispatch_mach_reconnect(this->mach_ctx, this->send_port, checkinMessage);
 
 				// let the user know that the connection got wonky
-				this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
+				XD("conn=%p name=%s deliver INTERRUPTED", self, XDN(this));
+			this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
 			}
 		} break;
 
@@ -472,6 +489,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 - (void)setEventHandler: (xpc_handler_t)eventHandler
 {
 	XPC_THIS_DECL(connection);
+	XD("conn=%p name=%s set_event_handler old=%p", self, XDN(this), this->event_handler);
 	Block_release(this->event_handler);
 	this->event_handler = Block_copy(eventHandler);
 }
@@ -533,6 +551,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	XPC_THIS_DECL(connection);
 
 	xpc_log_debug(connection, "connection %p: got xref disposed", this);
+	XD("conn=%p name=%s xref_dispose (last user ref released) activated=%d susp=%ld", self, XDN(this), (int)this->activated, (long)this->suspension_count);
 
 	if (this->is_server_peer && self.parentServer) {
 		// server peer connections can only be released by the server.
@@ -562,6 +581,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	XPC_THIS_DECL(connection);
 
 	xpc_log_debug(connection, "connection %p: got dealloc'ed", this);
+	XD("conn=%p name=%s dealloc handler=%p", self, XDN(this), this->event_handler);
 
 	pthread_rwlock_destroy(&this->activated_lock);
 	pthread_rwlock_destroy(&this->server_peers_lock);
@@ -622,6 +642,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 		this->is_listener = asServer;
 		this->service_name = serviceName;
+		XD("conn=%p create %s name=%s", self, asServer ? "listener" : "client", serviceName ? serviceName : "(null)");
 		this->mach_ctx = dispatch_mach_create_4libxpc((asServer ? "org.darlinghq.libxpc.server" : "org.darlinghq.libxpc.client"), queue, self, dispatch_mach_handler);
 	}
 	return self;
@@ -655,6 +676,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 			return nil;
 		}
 		this->checkin_port = endpoint.port;
+		XD("conn=%p create from endpoint", self);
 	}
 	return self;
 }
@@ -677,6 +699,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 		this->send_port = port;
 		this->recv_port = port;
+		XD("conn=%p create anonymous listener", self);
 	}
 	return self;
 }
@@ -743,6 +766,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	} else if (this->service_name) {
 		// client for named server
 		status = bootstrap_look_up(bootstrap_port, this->service_name, &this->checkin_port);
+		XD("conn=%p lookup name=%s kr=%d", self, this->service_name, (int)status);
 		if (status != KERN_SUCCESS) {
 			xpc_log_error(connection, "failed to lookup service with name \"%s\"", this->service_name);
 			goto invalid_out;
@@ -893,6 +917,7 @@ invalid_out:
 - (void)cancel
 {
 	XPC_THIS_DECL(connection);
+	XD("conn=%p name=%s cancel() by caller", self, XDN(this));
 	this->suspension_count = 0;
 	dispatch_mach_cancel(this->mach_ctx);
 }
@@ -907,6 +932,7 @@ invalid_out:
 {
 	@autoreleasepool {
 		XPC_THIS_DECL(connection);
+		XD("conn=%p name=%s send_message (no reply) lookup_failed=%d", self, XDN(this), (int)this->lookup_failed);
 		XPC_CLASS(serializer)* serializer = [XPC_CLASS(serializer) serializer];
 		dispatch_mach_msg_t message = NULL;
 		dispatch_mach_reason_t sendResult = 0;
@@ -934,6 +960,7 @@ invalid_out:
 {
 	@autoreleasepool {
 		XPC_THIS_DECL(connection);
+		XD("conn=%p name=%s send_message_with_reply lookup_failed=%d", self, XDN(this), (int)this->lookup_failed);
 		XPC_CLASS(serializer)* serializer = [XPC_CLASS(serializer) serializer];
 		xpc_connection_reply_context_t* context = NULL;
 		dispatch_mach_msg_t message = NULL;
@@ -1243,6 +1270,7 @@ void xpc_connection_activate(xpc_connection_t xconn) {
 XPC_EXPORT
 void xpc_connection_set_target_uid(xpc_connection_t xconn, uid_t uid) {
 	xpc_stub();
+	XD("conn=%p set_target_uid called", xconn);
 };
 
 XPC_EXPORT
