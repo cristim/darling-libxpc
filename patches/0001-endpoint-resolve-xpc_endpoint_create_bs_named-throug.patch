@@ -1,0 +1,157 @@
+From e706cf26524c2198cbf0393856deb3be1b6cdccd Mon Sep 17 00:00:00 2001
+From: Cristian Magherusan-Stanciu <cristi@leanercloud.com>
+Date: Mon, 16 Nov 2026 01:04:30 +0100
+Subject: [PATCH 1/2] endpoint: resolve xpc_endpoint_create_bs_named through
+ launchd
+
+The function was a stub that always returned NULL, so a client asking for the
+endpoint of a registered service could never reach it. Look the name up with
+bootstrap_look_up and wrap the returned port in an endpoint, the same port a
+named client connection checks in with. Return NULL, and log the name, when
+the service is not registered. The meaning of the flags argument and of the
+out type byte has no public source: flags are ignored and the type is
+reported as 0 (marked GUESS in the code) instead of being left uninitialised.
+
+Add libxpc_test_bs_named: a missing service gives NULL, the launchd test
+service gives an endpoint that a connection created from it can message and
+get the service's reply from.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2LBeE7Q2BrLby6CJ5eL7p
+---
+ src/endpoint.m      | 21 +++++++++++++---
+ test/CMakeLists.txt | 11 +++++++++
+ test/bs-named.c     | 60 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 89 insertions(+), 3 deletions(-)
+ create mode 100644 test/bs-named.c
+
+diff --git a/src/endpoint.m b/src/endpoint.m
+index 1c53527f2..48e41918e 100644
+--- a/src/endpoint.m
++++ b/src/endpoint.m
+@@ -21,9 +21,12 @@
+ #import <xpc/util.h>
+ #import <xpc/xpc.h>
+ #import <xpc/serialization.h>
++#include <bootstrap.h>
+ 
+ XPC_CLASS_SYMBOL_DECL(endpoint);
+ 
++XPC_LOGGER_DEF(endpoint);
++
+ OS_OBJECT_NONLAZY_CLASS
+ @implementation XPC_CLASS(endpoint)
+ 
+@@ -176,9 +179,21 @@ mach_port_t xpc_endpoint_copy_listener_port_4sim(xpc_endpoint_t xendpoint) {
+ 
+ XPC_EXPORT
+ xpc_endpoint_t xpc_endpoint_create_bs_named(const char* name, uint64_t flags, uint8_t* out_type) {
+-	// parameter 3's purpose is a guess
+-	xpc_stub();
+-	return NULL;
++	// GUESS (no public source): the endpoint of a named service is the port launchd hands out for that name,
++	// exactly what a client connection to the name would connect to. The meaning of `flags` and of the out
++	// parameter (a one-byte service type) is not known; flags are ignored and the type is reported as 0.
++	mach_port_t port = MACH_PORT_NULL;
++
++	if (!name || bootstrap_look_up(bootstrap_port, name, &port) != KERN_SUCCESS) {
++		xpc_log_error(endpoint, "failed to look up service with name \"%s\" for an endpoint", name ? name : "(null)");
++		return NULL;
++	}
++
++	if (out_type) {
++		*out_type = 0;
++	}
++
++	return [[XPC_CLASS(endpoint) alloc] initWithPortNoCopy: port];
+ };
+ 
+ XPC_EXPORT
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 2a8aae170..af4aa7591 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -66,3 +66,14 @@ target_link_libraries(libxpc_test_nonexistent_service
+ )
+ 
+ install(TARGETS libxpc_test_nonexistent_service DESTINATION libexec/darling/usr/libexec)
++
++
++add_darling_executable(libxpc_test_bs_named bs-named.c)
++
++target_link_libraries(libxpc_test_bs_named
++	xpc_static
++	objc
++)
++
++install(TARGETS libxpc_test_bs_named DESTINATION libexec/darling/usr/libexec)
++
+diff --git a/test/bs-named.c b/test/bs-named.c
+new file mode 100644
+index 000000000..b553f3d51
+--- /dev/null
++++ b/test/bs-named.c
+@@ -0,0 +1,60 @@
++// Needs the launchd test service (launchd-service/, plist installed with the tests) to be registered.
++#include <dispatch/dispatch.h>
++#include <xpc/xpc.h>
++#include <stdio.h>
++#include <unistd.h>
++
++#include "launchd-service/service.h"
++
++// private API under test; declared here because the SDK does not ship it
++xpc_endpoint_t xpc_endpoint_create_bs_named(const char* name, uint64_t flags, uint8_t* out_type);
++
++int main(void) {
++	char missing[160];
++	snprintf(missing, sizeof(missing), "org.darlinghq.test.no-such-service.%ld", (long)getpid());
++
++	uint8_t type = 0xAA;
++	if (xpc_endpoint_create_bs_named(missing, 0, &type) != NULL) {
++		fprintf(stderr, "FAIL: an endpoint was returned for a service that does not exist\n");
++		return 1;
++	}
++
++	type = 0xAA;
++	xpc_endpoint_t endpoint = xpc_endpoint_create_bs_named(TEST_SERVICE_NAME, 0, &type);
++	if (endpoint == NULL) {
++		fprintf(stderr, "FAIL: no endpoint for the registered service %s\n", TEST_SERVICE_NAME);
++		return 1;
++	}
++	if (type == 0xAA) {
++		fprintf(stderr, "FAIL: the out type parameter was left uninitialised\n");
++		return 1;
++	}
++
++	dispatch_queue_t queue = dispatch_queue_create("bs-named", NULL);
++	dispatch_semaphore_t replied = dispatch_semaphore_create(0);
++	__block int reply_type_ok = 0;
++	xpc_connection_t connection = xpc_connection_create_from_endpoint(endpoint);
++	xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {});
++	xpc_connection_resume(connection);
++
++	xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
++	xpc_dictionary_set_uint64(message, MESSAGE_TYPE_KEY, test_service_message_type_hello);
++	xpc_dictionary_set_string(message, HELLO_KEY, "hello through a bs-named endpoint");
++	xpc_connection_send_message_with_reply(connection, message, queue, ^(xpc_object_t reply) {
++		reply_type_ok = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
++			xpc_dictionary_get_uint64(reply, MESSAGE_TYPE_KEY) == test_service_message_type_hello;
++		dispatch_semaphore_signal(replied);
++	});
++	xpc_release(message);
++
++	if (dispatch_semaphore_wait(replied, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) {
++		fprintf(stderr, "FAIL: no reply from the service through its endpoint within 10 s\n");
++		return 1;
++	}
++	if (!reply_type_ok) {
++		fprintf(stderr, "FAIL: the reply was not the service's hello reply\n");
++		return 1;
++	}
++	puts("PASS: bs-named endpoint reaches the registered service, missing service gives NULL");
++	return 0;
++}
+-- 
+2.56.0
+
