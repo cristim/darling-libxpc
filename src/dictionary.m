@@ -32,6 +32,11 @@
 
 XPC_CLASS_SYMBOL_DECL(dictionary);
 
+// objc_storeWeak aborts the process when the object no longer allows weak references; a connection stops allowing them
+// as soon as the user released its last reference, while it can still be alive and handling a late reply. The
+// Or-Nil variant stores nil instead.
+extern id objc_storeWeakOrNil(id* location, id obj);
+
 OS_OBJECT_NONLAZY_CLASS
 @implementation XPC_CLASS(dictionary)
 
@@ -195,7 +200,7 @@ XPC_CLASS_HEADER(dictionary);
 - (void)setAssociatedConnection: (XPC_CLASS(connection)*)associatedConnection
 {
 	XPC_THIS_DECL(dictionary);
-	objc_storeWeak(&this->associatedConnection, associatedConnection);
+	objc_storeWeakOrNil(&this->associatedConnection, associatedConnection);
 }
 
 - (XPC_CLASS(object)*)objectForKey: (const char*)key
@@ -479,6 +484,10 @@ xpc_object_t xpc_dictionary_create_reply(xpc_object_t xorig) {
 
 		dict.outgoingPort = orig.incomingPort;
 		orig.incomingPort = MACH_PORT_NULL;
+
+		// documented (xpc_dictionary_get_remote_connection): a dictionary created through xpc_dictionary_create_reply
+		// has a connection over which a reply message can be sent
+		dict.associatedConnection = orig.associatedConnection;
 
 		return dict;
 	}

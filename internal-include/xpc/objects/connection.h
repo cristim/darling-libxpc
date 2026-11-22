@@ -46,6 +46,8 @@ XPC_IGNORE_DUPLICATE_PROTOCOL_POP;
 typedef struct xpc_connection_reply_context_s {
 	xpc_handler_t handler;
 	dispatch_queue_t queue;
+	// the connection the message was sent on; an internal reference on it is held until the reply handler has returned
+	XPC_CLASS(connection)* connection;
 } xpc_connection_reply_context_t;
 
 XPC_GENARR_DECL(connection, XPC_CLASS(connection)*, /* non-static */);
@@ -81,15 +83,23 @@ struct xpc_connection_s {
 
 	audit_token_t remote_credentials;
 
+	// serialises replacing the event handler with reading (and retaining) it for a call
+	pthread_mutex_t event_handler_lock;
+	// the "no event handler" fault is logged once per connection
+	bool no_handler_logged;
+
 	//
 	// mutable and lock-free
 	//
 	dispatch_mach_t mach_ctx;
 	void* user_context;
-	xpc_handler_t event_handler;
+	xpc_handler_t event_handler; // see event_handler_lock
 	xpc_finalizer_t finalizer;
 	atomic_intmax_t suspension_count;
 	bool is_cancelled;
+	// set when the user cancelled the connection or released its last reference; replies that never arrive are then
+	// reported as invalid rather than interrupted
+	atomic_bool cancel_requested;
 	// set when the named service couldn't be looked up; the connection is invalid, not interrupted
 	bool lookup_failed;
 

@@ -68,7 +68,10 @@ static void server_peer_array_item_dtor(XPC_CLASS(connection)** serverPeer) {
 	[*serverPeer release];
 };
 
-static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_handler_t handler, dispatch_queue_t queue) {
+// Keeps the connection alive until the context is destroyed: libdispatch calls the reply handler exactly once, either
+// with the reply or, once the connection is cancelled, with an error, and the connection must outlive that call even
+// when the last user reference is released (and the connection cancelled) before the reply handler runs.
+static xpc_connection_reply_context_t* xpc_connection_reply_context_create(XPC_CLASS(connection)* connection, xpc_handler_t handler, dispatch_queue_t queue) {
 	xpc_connection_reply_context_t* context = malloc(sizeof(xpc_connection_reply_context_t));
 
 	if (queue == NULL) {
@@ -77,6 +80,8 @@ static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_h
 
 	context->handler = Block_copy(handler);
 	context->queue = [queue retain];
+	context->connection = connection;
+	_os_object_retain_internal(connection);
 
 	xpc_log_debug(connection, "created reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
 
@@ -85,9 +90,11 @@ static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_h
 
 static void xpc_connection_reply_context_destroy(xpc_connection_reply_context_t* context) {
 	xpc_log_debug(connection, "destroying reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
+	XPC_CLASS(connection)* connection = context->connection;
 	Block_release(context->handler);
 	[context->queue release];
 	free(context);
+	_os_object_release_internal(connection);
 };
 
 // returns `true` if there was no error, `false` otherwise
@@ -148,6 +155,54 @@ static bool handle_send_result(dispatch_mach_msg_t message, dispatch_mach_reason
 	return false;
 };
 
+// What a reply handler (or a synchronous send) gets when the reply will never arrive. A connection that was cancelled,
+// or can never connect, is invalid; a peer that went away is an interruption, from which a named connection can recover.
+static xpc_object_t lost_reply_error(struct xpc_connection_s* this) {
+	if (this->service_name && !this->lookup_failed && !atomic_load(&this->cancel_requested)) {
+		return XPC_ERROR_CONNECTION_INTERRUPTED;
+	}
+	return XPC_ERROR_CONNECTION_INVALID;
+};
+
+// Swaps the handler slot under the lock; the caller releases the returned old block outside it.
+static xpc_handler_t exchange_event_handler(XPC_CLASS(connection)* self, xpc_handler_t newHandler) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t old = NULL;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	old = this->event_handler;
+	this->event_handler = newHandler;
+	pthread_mutex_unlock(&this->event_handler_lock);
+
+	return old;
+};
+
+// Calls the event handler that is current when the event is delivered. The block is retained under the same lock that
+// replacing it takes, so a replacement (from another thread, or from inside the handler itself) cannot free it between
+// being read and being retained, and it outlives its own body: what it captured stays alive until it returns.
+// A replacement made while a handler runs takes effect from the next event; it does not interrupt the running call.
+static void call_event_handler(XPC_CLASS(connection)* self, xpc_object_t event) {
+	XPC_THIS_DECL(connection);
+	xpc_handler_t handler = NULL;
+	bool log_missing = false;
+
+	pthread_mutex_lock(&this->event_handler_lock);
+	handler = Block_copy(this->event_handler);
+	if (!handler && !this->no_handler_logged) {
+		this->no_handler_logged = true;
+		log_missing = true;
+	}
+	pthread_mutex_unlock(&this->event_handler_lock);
+
+	if (handler) {
+		handler(event);
+		Block_release(handler);
+	} else if (log_missing) {
+		// libxpc used to crash here; real behaviour is NEEDS-REAL-MAC. Fail loud once instead of silently dropping.
+		xpc_log_fault(connection, "connection %p (service %s) received an event but has no event handler; dropping events", self, this->service_name ? this->service_name : "(anonymous)");
+	}
+};
+
 static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, dispatch_mach_msg_t message, mach_error_t error) {
 	XPC_CLASS(connection)* self = context;
 	XPC_THIS_DECL(connection);
@@ -205,7 +260,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				}
 				[self addServerPeer: serverPeer]; // takes ownership of the server peer connection
 
-				this->event_handler(serverPeer);
+				call_event_handler(self, serverPeer);
 			} else {
 				XPC_CLASS(dictionary)* dict = nil;
 				audit_token_t* token = NULL;
@@ -229,7 +284,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 					[dict setAssociatedAuditToken: token];
 				}
 
-				this->event_handler(dict);
+				call_event_handler(self, dict);
 			}
 		} break;
 
@@ -246,12 +301,11 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 			[self.parentServer removeServerPeer: self]; // server peers should unregister themselves from their parent servers
 			xpc_log_debug(connection, "connection %p: cancelled", self);
 
-			this->event_handler(XPC_ERROR_CONNECTION_INVALID);
+			call_event_handler(self, XPC_ERROR_CONNECTION_INVALID);
 
 			// we're never going to call the event handler again, so release it;
 			// if they were holding a reference on us, it gets released
-			Block_release(this->event_handler);
-			this->event_handler = NULL;
+			Block_release(exchange_event_handler(self, NULL));
 
 			// we've been cancelled; this is the very last event we'll ever receive, so we can release our internal reference now.
 			// note that this doesn't mean we instantly die; the user might still be holding their reference on us
@@ -310,7 +364,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 				dispatch_mach_reconnect(this->mach_ctx, this->send_port, checkinMessage);
 
 				// let the user know that the connection got wonky
-				this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
+				call_event_handler(self, XPC_ERROR_CONNECTION_INTERRUPTED);
 			}
 		} break;
 
@@ -323,7 +377,7 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 		} break;
 
 		case DISPATCH_MACH_SIGTERM_RECEIVED: {
-			this->event_handler(XPC_ERROR_TERMINATION_IMMINENT);
+			call_event_handler(self, XPC_ERROR_TERMINATION_IMMINENT);
 		} break;
 
 		default: {
@@ -364,10 +418,12 @@ static dispatch_queue_t dmxh_msg_context_reply_queue(void* msg_context) {
 };
 
 static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t reason, dispatch_mach_msg_t message) {
-	XPC_CLASS(connection)* self = self_context;
-	XPC_THIS_DECL(connection);
 	xpc_connection_reply_context_t* context = dispatch_get_context(message);
+	// not self_context: only the reply context holds a reference, the channel's own pointer may be dangling by now
+	XPC_CLASS(connection)* self = context->connection;
+	XPC_THIS_DECL(connection);
 	xpc_object_t result = NULL;
+	XPC_CLASS(dictionary)* reply = nil;
 	mach_msg_header_t* header = dispatch_mach_msg_get_msg(message, NULL);
 	mach_port_t localPort = header->msgh_local_port;
 	audit_token_t* token = NULL;
@@ -386,30 +442,30 @@ static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t 
 				// if the message is only a header, it means that the remote peer disconnected/crashed
 				xpc_log(connection, "connection %p: async reply handler received empty message due to peer disconnect", this);
 				mach_msg_destroy(header);
-				if (this->service_name && !this->lookup_failed) {
-					result = XPC_ERROR_CONNECTION_INTERRUPTED;
-				} else {
-					result = XPC_ERROR_CONNECTION_INVALID;
-				}
+				result = lost_reply_error(this);
 				goto handle_it;
 			}
 
 			[message retain]; // because the deserializer consumes a reference on the message
-			result = [XPC_CLASS(deserializer) process: message];
-			if (!result) {
+			reply = [XPC_CLASS(deserializer) process: message];
+			if (!reply) {
 				xpc_abort("failed to deserialize reply");
 			}
+			// QUIRK: a reply handed to a reply handler (or returned by the synchronous send) reports the connection it
+			// arrived on from xpc_dictionary_get_remote_connection, like a message handed to the event handler.
+			// The documentation covers only dictionaries received by an event handler and created by
+			// xpc_dictionary_create_reply; "any other dictionary" is documented as NULL.
+			// Evidence: inference only (weakest tier), the connection is where the reply can be answered.
+			// NEEDS-REAL-MAC. Test: test/reply-remote-connection.c
+			reply.associatedConnection = self;
+			result = reply;
 			// `header` is no longer valid
 		} break;
 
 		case DISPATCH_MACH_ASYNC_WAITER_DISCONNECTED: {
 			xpc_log(connection, "connection %p: async reply handler was informed that we were cancelled while waiting", this);
 			mach_msg_destroy(header);
-			if (this->service_name && !this->lookup_failed) {
-				result = XPC_ERROR_CONNECTION_INTERRUPTED;
-			} else {
-				result = XPC_ERROR_CONNECTION_INVALID;
-			}
+			result = lost_reply_error(this);
 		} break;
 
 		default: {
@@ -479,9 +535,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 - (void)setEventHandler: (xpc_handler_t)eventHandler
 {
-	XPC_THIS_DECL(connection);
-	Block_release(this->event_handler);
-	this->event_handler = Block_copy(eventHandler);
+	Block_release(exchange_event_handler(self, Block_copy(eventHandler)));
 }
 
 - (xpc_finalizer_t)finalizer
@@ -555,6 +609,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 		xpc_abort("last reference to a suspended connection was released");
 	}
 
+	atomic_store(&this->cancel_requested, true);
 	if (this->mach_ctx) {
 		dispatch_mach_cancel(this->mach_ctx);
 	}
@@ -574,6 +629,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_destroy(&this->activated_lock);
 	pthread_rwlock_destroy(&this->server_peers_lock);
 	pthread_rwlock_destroy(&this->remote_credentials_lock);
+	pthread_mutex_destroy(&this->event_handler_lock);
 
 	xpc_assumes_zero(xpc_mach_port_release_send(this->send_port));
 	xpc_assumes_zero(xpc_mach_port_release_send(this->checkin_port));
@@ -609,6 +665,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_init(&this->activated_lock, NULL);
 	pthread_rwlock_init(&this->server_peers_lock, NULL);
 	pthread_rwlock_init(&this->remote_credentials_lock, NULL);
+	pthread_mutex_init(&this->event_handler_lock, NULL);
 
 	this->suspension_count = 1;
 
@@ -924,6 +981,7 @@ invalid_out:
 {
 	XPC_THIS_DECL(connection);
 	this->suspension_count = 0;
+	atomic_store(&this->cancel_requested, true);
 	dispatch_mach_cancel(this->mach_ctx);
 }
 
@@ -987,7 +1045,7 @@ invalid_out:
 			xpc_abort("failed to finalize message");
 		}
 
-		context = xpc_connection_reply_context_create(handler, queue);
+		context = xpc_connection_reply_context_create(self, handler, queue);
 		dispatch_set_context(message, context);
 
 		dispatch_mach_send_with_result_and_async_reply_4libxpc(this->mach_ctx, message, 0, 0, &sendResult, &sendError);
@@ -1035,11 +1093,7 @@ invalid_out:
 	}
 
 	if (!reply) {
-		if (this->service_name && !this->lookup_failed) {
-			return XPC_ERROR_CONNECTION_INTERRUPTED;
-		} else {
-			return XPC_ERROR_CONNECTION_INVALID;
-		}
+		return lost_reply_error(this);
 	}
 
 	header = dispatch_mach_msg_get_msg(reply, NULL);
@@ -1047,17 +1101,18 @@ invalid_out:
 	if (header->msgh_size == sizeof(mach_msg_header_t)) {
 		// if the message is only a header, it means that the remote peer disconnected/crashed
 		mach_msg_destroy(header);
-		if (this->service_name && !this->lookup_failed) {
-			return XPC_ERROR_CONNECTION_INTERRUPTED;
-		} else {
-			return XPC_ERROR_CONNECTION_INVALID;
-		}
+		return lost_reply_error(this);
 	}
 
 	@autoreleasepool {
 		// give it its own autoreleasepool to reduce memory usage
 		// (to ensure that the serializer from before is released)
 		result = [[XPC_CLASS(deserializer) process: reply] retain];
+		// QUIRK: like a reply handed to a reply handler, this reply reports the connection it arrived on from
+		// xpc_dictionary_get_remote_connection. Undocumented (the documentation says NULL for dictionaries other
+		// than those received by an event handler or created by xpc_dictionary_create_reply); evidence is inference
+		// only (weakest tier), NEEDS-REAL-MAC. Test: test/reply-remote-connection.c
+		result.associatedConnection = self;
 	}
 
 	return result;

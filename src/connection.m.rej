@@ -1,0 +1,17 @@
+--- src/connection.m
++++ src/connection.m
+@@ -364,12 +418,12 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason,
+ 				dispatch_mach_reconnect(this->mach_ctx, this->send_port, checkinMessage);
+ 
+ 				// let the user know that the connection got wonky
+-				this->event_handler(XPC_ERROR_CONNECTION_INTERRUPTED);
++				call_event_handler(self, XPC_ERROR_CONNECTION_INTERRUPTED);
+ 			}
+ 		} break;
+ 
+ 		case DISPATCH_MACH_SIGTERM_RECEIVED: {
+-			this->event_handler(XPC_ERROR_TERMINATION_IMMINENT);
++			call_event_handler(self, XPC_ERROR_TERMINATION_IMMINENT);
+ 		} break;
+ 
+ 		default: {
